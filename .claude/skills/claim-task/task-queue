@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Decides which issue an agent should pick up next, and why every other one is
+# out. One definition of "eligible" rather than one per agent: the fleet only
+# stays coherent if two agents waking up five seconds apart compute the same
+# answer from the same board.
+#
+# Deliberately does no network. Eligibility is a pure function of the issue set,
+# and the fetch is the part that differs by surface -- a cloud agent has the
+# GitHub MCP and neither `gh` nor a token, CI has a token and no MCP. Making the
+# caller supply the JSON keeps the part that would drift in one file and lets the
+# part that varies stay varied.
+
+usage() {
+  cat <<'USAGE'
+task-queue next [--issues <file>] [--json]
+task-queue why <issue> [--issues <file>] [--json]
+
+Reads a normalised issue set and reports the queue in pick order, or why one
+issue is not pickable.
+
+Input is a JSON array, from --issues, from TASK_QUEUE_ISSUES_FILE, or on stdin:
+
+  [{ "number":   126,
+     "title":    "...",
+     "queue":    "Ready",
+     "priority": "High",
+     "claim":    "sess-9",
+     "blocked_by": [134],
+     "touches":  ["apps/web/src/app/page.tsx"] }]
+
+The keys map to issue fields: queue is Queue, blocked_by is "Blocked by issue",
+touches is Touches, priority is Priority, claim is Claim.
+
+"Blocked by issue" and Touches are single text fields, so SPLITTING THEM ON
+WHITESPACE IS THE CALLER'S JOB: "134 96" becomes [134, 96], not ["134 96"].
+Forgetting is the likeliest bug on this path, so an entry still carrying a space
+is reported against its own issue rather than read past -- reading only the first
+number in it used to hand out an issue whose other blocker was wide open.
+
+What a person typed is read where it can be: a blocked_by entry gives up every
+number in it, so "#134" is 134. An entry with no number in it holds its own issue
+back and says so, because an unreadable blocker might be an open one. Only the
+JSON shape is refused outright, and only a normaliser chooses that.
+
+Pass every OPEN issue. A number under blocked_by that is absent from the input
+is read as closed -- and reported as a warning, because a typo looks the same.
+
+An issue is eligible when all three hold:
+  - queue is Ready
+  - every blocked_by issue is closed
+  - its touches do not overlap any held by an issue in flight, where in flight
+    means In progress, Needs review, Under review, or Ready to merge
+
+Every state from In progress onward holds its files, because the branch is
+unmerged in all of them: a second agent branching off the default branch would
+collide at merge rather than at pick time. Ready to merge holds them most
+certainly of all -- the work is finished and waiting on a human.
+
+Waiting for input is the other end of that sentence and its opposite in every
+mechanical way: nothing has started, so there is no branch, so it holds no
+files -- Triage and Ready are its neighbours there, not Ready to merge. Both it
+and Ready to merge wait on a person; only one of them has work behind it.
+Putting finished work here instead releases the files of a branch that is still
+out there, which is the one way this state can do damage.
+
+Queue is matched case-insensitively, so "In Progress" is that state rather than
+a typo for it. A value outside the seven holds its files anyway and is reported,
+because serialising work that could have run costs throughput while releasing a
+lock by accident costs two agents editing the same file.
+
+An in-flight issue that declares no touches holds nothing, and says so -- that
+is a triage omission rather than a task with no files.
+
+Ties break by priority (Urgent, High, Medium, Low), then issue number ascending.
+An unset priority sorts last, so forgetting to set one cannot promote an issue.
+A priority outside those four also sorts last and is reported as a warning,
+because a scale nobody declared is not a scale.
+USAGE
+}
+
+die() { echo "task-queue: $1" >&2; exit 1; }
+
+cmd="${1:-}"; shift 2>/dev/null || true
+case "$cmd" in
+  next|why) ;;
+  -h|--help|"") usage; exit 0 ;;
+  *) die "unknown command: $cmd (expected next or why)" ;;
+esac
+
+target=""; issues_file="${TASK_QUEUE_ISSUES_FILE:-}"; as_json=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --issues) [ $# -ge 2 ] || die "--issues needs a value"; issues_file="$2"; shift 2 ;;
+    --json)   as_json=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*)       die "unknown flag: $1" ;;
+    *)        if [ -n "$target" ]; then die "unexpected argument: $1"; fi; target="$1"; shift ;;
+  esac
+done
+
+if [ "$cmd" = "why" ]; then
+  [ -n "$target" ] || die "why needs an issue number"
+  case "$target" in (*[!0-9]*) die "not an issue number: $target" ;; esac
+  [ "$target" -gt 0 ] || die "not an issue number: $target"
+fi
+
+# next reshapes its whole output around a positional it never asked for, which
+# turns `next 2` into `why 2` silently -- and a --json caller reading .next then
+# sees null and concludes nothing is pickable.
+if [ "$cmd" = "next" ] && [ -n "$target" ]; then
+  die "next takes no issue number (did you mean: why $target?)"
+fi
+
+command -v jq >/dev/null 2>&1 || die "jq is required"
+
+if [ -n "$issues_file" ]; then
+  [ -r "$issues_file" ] || die "cannot read $issues_file"
+  input="$(cat "$issues_file")"
+else
+  [ ! -t 0 ] || die "no input: pass --issues, set TASK_QUEUE_ISSUES_FILE, or pipe JSON on stdin"
+  input="$(cat)"
+fi
+
+printf '%s' "$input" | jq -e 'type == "array"' >/dev/null 2>&1 \
+  || die "input is not a JSON array"
+printf '%s' "$input" | jq -e 'all(type == "object")' >/dev/null 2>&1 \
+  || die "every entry in the input must be an issue object"
+
+# Only the JSON shape is refused here, and only a normaliser can get that wrong
+# -- it decides every type in this document. What a person typed into a text
+# field is content, and content is reported per issue instead, because refusing
+# the board over it stops every agent in the fleet: "#134 96" under Blocked by
+# issue is one human being ordinary, and it used to fail this gate.
+problems="$(printf '%s' "$input" | jq -r '
+  def ref: "#\(.number // "?")";
+  [ .[]
+    | (if (.number | type) != "number"
+       then "every issue needs a numeric number" else empty end),
+      (if .queue != null and (.queue | type) != "string"
+       then "\(ref): queue must be a string" else empty end),
+      (if .priority != null and (.priority | type) != "string"
+       then "\(ref): priority must be a string" else empty end),
+      (if .claim != null and (.claim | type) != "string"
+       then "\(ref): claim must be a string" else empty end),
+      (if .touches != null and ((.touches | type) != "array"
+                                or (.touches | map(type != "string") | any))
+       then "\(ref): touches must be an array of paths" else empty end),
+      (if .blocked_by != null
+          and ((.blocked_by | type) != "array"
+               or (.blocked_by | map((type == "number") or (type == "string") | not) | any))
+       then "\(ref): blocked_by must be an array of issue numbers or text" else empty end)
+  ]
+  + ([.[].number | select(type == "number")] | group_by(.)
+     | map(select(length > 1) | "#\(.[0]) appears more than once in the input"))
+  | unique | .[]')"
+if [ -n "$problems" ]; then
+  printf '%s\n' "$problems" | while IFS= read -r p; do
+    echo "task-queue: $p" >&2
+  done
+  exit 1
+fi
+
+verdict="$(printf '%s' "$input" | jq --argjson want "${target:-0}" '
+  # A touches entry is a path or a directory glob. Strip the glob tail so the
+  # comparison is a path-prefix one, then require the prefix to land on a
+  # segment boundary -- without that, "a/b" would swallow "a/bc".
+  #
+  # Brace expansion is NOT handled: "rules/{a,b}.mjs" is read as one literal
+  # path that matches nothing. List the files separately.
+  # A leading "/" or "./" is what somebody writes when asked for a path in a
+  # repo, so strip those too -- "/src/app.ts" and "src/app.ts" naming different
+  # files was a lock that silently missed. Every spelling of "the whole repo"
+  # reduces to nothing, and an entry that reduces to nothing is reported rather
+  # than left to look like a lock.
+  def trim: sub("^\\s+"; "") | sub("\\s+$"; "");
+  def norm:
+    trim
+    | sub("^\\./"; "")
+    | sub("/\\*\\*$"; "") | sub("/\\*$"; "")
+    | sub("^\\*\\*$"; "")  | sub("^\\*$"; "") | sub("^\\.$"; "")
+    | sub("/+$"; "") | sub("^/+"; "");
+  def overlaps($a; $b):
+    any($a[]; . as $x | any($b[]; . as $y |
+      ($x == $y)
+      or (($y + "/") | startswith($x + "/"))
+      or (($x + "/") | startswith($y + "/"))));
+
+  # Priority is a named option rather than a number, so the order it implies has
+  # to be written down. Unlike an integer rank this cannot drift quietly: an
+  # option outside the table sorts last AND says so.
+  {"urgent": 0, "high": 1, "medium": 2, "low": 3} as $rank_of
+  | 9 as $unranked
+  | ["In progress", "Needs review", "Under review", "Ready to merge"] as $inflight
+  # The seven are listed again rather than built from $inflight. Deriving them
+  # made dropping a state from $inflight turn it unknown, which holds files for
+  # the other reason -- so the suite stayed green under the one mutation that
+  # matters most here. Two separate facts, two separate lists.
+  | ["Triage", "Waiting for input", "Ready", "In progress", "Needs review", "Under review", "Ready to merge"] as $states
+  | ($states | map({key: ascii_downcase, value: .}) | from_entries) as $queue_of
+  # Blanks are dropped AFTER norm, not before: norm turns "/" and "/**" into ""
+  # just as surely as a double space does, and an empty entry equals the other
+  # empty entry on the other issue, so two tasks collide over nothing at all.
+  #
+  # An unset single-select reaches us as "" as readily as as an absent key, and
+  # the two must not mean opposite things now that an unrecognised state holds
+  # every file it names.
+  # Every number in an entry, not the first: reading only the first silently
+  # dropped the rest, so an unsplit "134 96" was handed out as blocked by #134
+  # alone and its real blocker went unreported. An entry carrying more than one
+  # number, or whitespace after trimming, is a caller that did not split -- the
+  # likeliest normalisation bug here, since the field itself holds "134 96".
+  | map(. + {
+      _touches:    ((.touches // []) | map(norm) | map(select(test("\\S")))),
+      _empty_touches: ((.touches // []) | map(select(norm | test("\\S") | not))),
+      _unsplit_touches: ((.touches // []) | map(trim) | map(select(test("\\s")))),
+      _glob_touches: ((.touches // []) | map(select(norm | test("\\*")))),
+      _blocked_by: ((.blocked_by // [])
+                    | map(if type == "string" then [scan("[0-9]+") | tonumber] else [.] end)
+                    | flatten),
+      _unreadable_blockers: ((.blocked_by // [])
+                             | map(select(type == "string" and test("\\S")
+                                          and ([scan("[0-9]+")] | length) == 0))),
+      _unsplit_blockers: ((.blocked_by // [])
+                          | map(select(type == "string"
+                                       and (((trim | test("\\s")) or ([scan("[0-9]+")] | length) > 1))))),
+      _priority:   (.priority // null),
+      _claim:      (if ((.claim // "") | test("^\\s*$")) then null else (.claim | trim) end),
+      _queue:      (if ((.queue // "") | test("^\\s*$")) then "Triage" else .queue end)
+    })
+  | map(. + { _canon_queue: ($queue_of[._queue | ascii_downcase] // null) })
+  | map(. + {
+      _order: (if ._priority == null then $unranked
+               else ($rank_of[._priority | ascii_downcase] // $unranked) end),
+      _unknown_priority: (._priority != null
+                          and ($rank_of[._priority | ascii_downcase] == null)),
+      _holds_files: (._canon_queue as $q
+                     | $q == null or ($inflight | index($q)) != null)
+    })
+  | . as $all
+  | ([$all[].number]) as $present
+  | map(
+      . as $i
+      # The input is every open issue, so "present" is exactly "still open" and
+      # "absent" is exactly "closed". No second lookup can say more than that.
+      | ($i._blocked_by | map(select(. as $n | $present | index($n)))) as $still_open
+      | ($i._blocked_by - $still_open) as $absent
+      | ($all
+         | map(select(.number != $i.number and ._holds_files))
+         | map(select(overlaps($i._touches; ._touches)))
+         | map(.number)) as $collisions
+      | {
+          number:   $i.number,
+          title:    ($i.title // ""),
+          # The field as it reads, and the canonical reading of it. Reporting
+          # only the reading hid an unset field behind the Triage it stands in
+          # for, and left every consumer to redo the case-insensitive match --
+          # the one query SKILL.md asks a reviewer for, selecting on Needs
+          # review, missed an issue whose field was typed in the wrong case.
+          queue:    ($i.queue // null),
+          state:    $i._canon_queue,
+          claim:    $i._claim,
+          priority: $i._priority,
+          order:    $i._order,
+          eligible: (($i._canon_queue == "Ready") and ($still_open | length) == 0
+                     and ($collisions | length) == 0 and ($i._unreadable_blockers | length) == 0
+                     and ($i._unsplit_blockers | length) == 0),
+          blocked_by_open: $still_open,
+          collides_with:   $collisions,
+          warnings: (($absent | map("#\($i.number) names blocked_by #\(.), which is not in the input; read as closed"))
+                     + ($i._unreadable_blockers
+                        | map("#\($i.number) has a Blocked by issue entry with no number in it (\"\(.)\"); held back until it is readable"))
+                     + ($i._empty_touches
+                        | map("#\($i.number) has a Touches entry that names no path (\"\(.)\"); it locks nothing"))
+                     + ($i._unsplit_touches
+                        | map("#\($i.number) has a Touches entry with a space in it (\"\(.)\"); it was not split, so it matches no path and locks nothing"))
+                     + ($i._glob_touches
+                        | map("#\($i.number) has a Touches entry with a * left in it (\"\(.)\"); only a trailing /* or /** is understood, so it locks nothing"))
+                     + ($i._unsplit_blockers
+                        | map("#\($i.number) has a Blocked by issue entry that was not split (\"\(.)\"); held back until each number is its own entry"))
+                     # The two states an agent is meant to be holding, which is
+                     # the precondition the reclaim rule uses. Needs review and
+                     # Ready to merge are held by nobody, by design.
+                     + (if (["In progress", "Under review"] | index($i._canon_queue)) != null and $i._claim == null
+                        then ["#\($i.number) is \($i._queue) with no Claim, so it holds its files and nobody holds it"]
+                        else [] end)
+                     + (if $i._unknown_priority
+                        then ["#\($i.number) has priority \"\($i._priority)\", which is not one of Urgent, High, Medium, Low; sorted last"]
+                        else [] end)
+                     + (if $i._canon_queue == null
+                        then ["#\($i.number) has queue \"\($i._queue)\", which is not one of Triage, Waiting for input, Ready, In progress, Needs review, Under review, Ready to merge; its files stay held"]
+                        else [] end)
+                     + (if $i._canon_queue != null and $i._holds_files and ($i._touches | length) == 0
+                        then ["#\($i.number) is \($i._queue) and declares no Touches, so it holds no files"]
+                        else [] end))
+        }
+      | .reasons = (
+          (if $i._canon_queue != "Ready" then ["queue is \($i._queue), not Ready"] else [] end)
+          + (.blocked_by_open | map("blocked by #\(.), still open"))
+          + (.collides_with  | map("touches code held by #\(.), in flight"))
+          + ($i._unreadable_blockers | map("blocked by \"\(.)\", which names no issue number"))
+          + ($i._unsplit_blockers | map("blocked by \"\(.)\", which was not split into one number per entry"))
+        )
+    )
+  | sort_by((if .eligible then 0 else 1 end), .order, .number)
+  | { queue: ., next: (map(select(.eligible)) | first | .number // null) }
+  | if $want > 0 then { asked: $want, issue: (.queue[] | select(.number == $want)) } else . end
+')"
+
+# Before the --json branch, not inside the text one: an empty selection makes
+# the whole verdict empty, so --json used to print nothing and exit 0 -- and
+# --json is the path a caller scripts against.
+if [ "$cmd" = "why" ]; then
+  printf '%s' "$verdict" | jq -e '.issue' >/dev/null 2>&1 \
+    || die "#$target is not in the input (closed, or not fetched)"
+fi
+
+if [ "$as_json" = 1 ]; then
+  printf '%s\n' "$verdict"
+  exit 0
+fi
+
+if [ "$cmd" = "why" ]; then
+  printf '%s' "$verdict" | jq -r '
+    .issue
+    | "#\(.number)  \(.title)",
+      "queue:    \(.state)    priority: \(.priority // "unset")",
+      (if .eligible then "verdict:  pickable" else "verdict:  not pickable" end),
+      (.reasons   | map("  - " + .) | .[]),
+      (.warnings  | map("  ! " + .) | .[])'
+  exit 0
+fi
+
+printf '%s' "$verdict" | jq -r '
+  (.queue | map(select(.eligible))
+   | if length == 0 then "nothing is pickable right now"
+     else "pickable, in order:", (.[] | "  \(.priority // "--")  #\(.number)  \(.title)") end),
+  (.queue | map(select(.eligible | not))
+   | if length == 0 then empty
+     else "", "held back:",
+          (.[] | "  \(.priority // "--")  #\(.number)  \(.title)\n      \(.reasons | join("; "))")
+     end),
+  (.queue | map(.warnings) | add // [] | unique
+   | if length == 0 then empty else "", (.[] | "  ! " + .) end)'
