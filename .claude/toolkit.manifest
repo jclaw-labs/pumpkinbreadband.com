@@ -1,0 +1,20 @@
+# Managed by local-config bin/sync-project -- do not edit by hand.
+# Every path below is a vendored copy. Edit the source in local-config,
+# not here; the next sync overwrites whatever it finds.
+source	https://github.com/jclaw-labs/local-config
+commit	671efe9178d733b7d5690fcf9e5423ba59d3a5f4
+file	901673b6be06d726c2a55ad3bae948c370c57130	.claude/skills/address-deep-review/SKILL.md
+file	9bcd899fbd9286e097740eb24236c56507050605	.claude/skills/capture-pr-screenshots/SKILL.md
+file	cfa7ab5bebb13d4a55058f230fa1edbda01ffe1c	.claude/skills/claim-task/SKILL.md
+file	c1ca8cd114c05b2a3edc31270254b196eef978e3	.claude/skills/claim-task/task-queue
+file	eb1ee1e67c03cff336627460da819166408dc83a	.claude/skills/create-pr/SKILL.md
+file	4c67f5e3fb365de6256c8b87231e42e98cf9dfea	.claude/skills/deep-review-orchestrate/SKILL.md
+file	2b0337c9bcf3c3ffe22a0c5e90b651048d96c8e1	.claude/skills/deep-review-orchestrate/review-loop-state
+file	a35a8835e00d87d25ebc02c109ec8af564639e9c	.claude/skills/deep-review/SKILL.md
+file	11069a322275b6d54b9ed5b03807e23a588100d3	.claude/skills/resolve-conflicts/SKILL.md
+file	7d896d72487d1a408f1120384e28d9e790878a61	.claude/skills/rfc-review/SKILL.md
+file	5179895f404508de93d3200044cce49ed445a2b1	.claude/skills/stacked-pr-rules/SKILL.md
+file	78af2b25135a66467fc02cc4b978bfc3967563c7	.claude/skills/tidy-commits/SKILL.md
+file	0ce9e61c1fdd01b81f3f858a46f35ce6cd62dfb1	.claude/skills/writing-style/SKILL.md
+file	20e192f01bce8c47d457eb702f9252114dc124cb	.claude/verify-toolkit
+file	0032a51e4558356ff504b44fdeb8f9e8177ca65e	AGENTS.md
