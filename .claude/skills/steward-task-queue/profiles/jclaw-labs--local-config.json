@@ -1,0 +1,173 @@
+{
+  "schema_version": 2,
+  "backend": "github-issues",
+  "cadence_minutes": {
+    "steward": 5,
+    "worker": 5,
+    "reviewer": 5,
+    "merge_monitor": 5
+  },
+  "ready_supply": {
+    "minimum": 5,
+    "target_minimum": 10,
+    "target_maximum": 12
+  },
+  "ready_audit_batch": 10,
+  "queue": {
+    "states": [
+      "Triage",
+      "Waiting for input",
+      "Ready",
+      "In progress",
+      "Needs review",
+      "Under review",
+      "Ready to merge"
+    ]
+  },
+  "priority": {
+    "values": [
+      "Urgent",
+      "High",
+      "Medium",
+      "Low"
+    ]
+  },
+  "tracker": {
+    "repository": "jclaw-labs/local-config",
+    "api_version": "2026-03-10",
+    "fields": {
+      "priority": 47131523,
+      "queue": 47135033,
+      "blocked_by": 47135117,
+      "touches": 47135126,
+      "claim": 47135143
+    },
+    "values_endpoint": "/repositories/{repository_id}/issues/{number}/issue-field-values",
+    "close_reasons": [
+      "completed",
+      "duplicate",
+      "not_planned"
+    ]
+  },
+  "writes": {
+    "comment_prefix": "[Cursor]",
+    "field_values": {
+      "set": {
+        "method": "POST",
+        "endpoint": "/repositories/{repository_id}/issues/{number}/issue-field-values",
+        "body_key": "issue_field_values",
+        "semantics": "additive"
+      },
+      "clear": {
+        "method": "DELETE",
+        "endpoint": "/repositories/{repository_id}/issues/{number}/issue-field-values/{field_id}",
+        "semantics": "single-field"
+      }
+    }
+  },
+  "ci_exceptions": [
+    {
+      "provider": "github-actions",
+      "condition": "zero-step failure caused by an account-level billing block",
+      "action": "report as external and judge the code from valid evidence"
+    }
+  ],
+  "hints": [
+    {
+      "kind": "issue",
+      "reference": 230,
+      "note": "refresh queue field descriptions and documentation",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 438,
+      "note": "add `Needs decision`",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 342,
+      "note": "account quota/billing recovery",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 395,
+      "note": "downstream Substack skill sync after PR 375",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 459,
+      "note": "decide whether `stest` rejects or clears incompatible inherited `PLAYWRIGHT_ENV`",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 467,
+      "note": "choose a durable claim/worktree liveness mechanism",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 310,
+      "note": "approved a narrow, non-evaluating resolver for leading literal path assignments; resolve only exact target-path operands; fail closed on unresolved risky paths; teach literal absolute paths in later agent shell calls; test the helper and each consumer",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 126,
+      "note": "policy decision accepted and moved to Ready",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 131,
+      "note": "policy decision accepted and moved to Ready",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 226,
+      "note": "policy decision accepted and moved to Ready",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 263,
+      "note": "policy decision accepted and moved to Ready",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 431,
+      "note": "policy decision accepted and moved to Ready",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 111,
+      "note": "mixed umbrella split/routed and closed",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 128,
+      "note": "mixed umbrella split/routed and closed",
+      "revalidate": true
+    },
+    {
+      "kind": "issue",
+      "reference": 437,
+      "note": "mixed umbrella split/routed and closed",
+      "revalidate": true
+    },
+    {
+      "kind": "external-issue",
+      "reference": "substackinc/agent-dev#13",
+      "note": "duplicate-slot runtime safety was routed there",
+      "revalidate": true
+    }
+  ]
+}
