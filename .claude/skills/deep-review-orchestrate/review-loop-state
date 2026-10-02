@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# -e because the only consumer is an unattended loop, and it branches on the exit
+# status alone. Every failure below is caught by an explicit `|| die`, so nothing
+# here needs it today -- it is the next edit that would otherwise fail quietly and
+# still report success. The cost is that a bare `test && action` is a failing
+# command when the test is false, so those are written as `if` throughout.
+
+
+ROUND_CAP=5
+
+usage() {
+  cat <<'USAGE'
+review-loop-state <pr> [--repo owner/name] [--recorded <full-sha>] [--json]
+review-loop-state --check-body <file> [--expect review|response]
+
+Reports a deep-review loop's state for a PR: rounds complete, the next round
+number, whether the round cap is reached, the PR head, and any must-address
+declines to check. With --recorded, also whether the head has moved since you
+recorded it, and whether a capped loop stopped clean.
+
+When the branch has advanced but the PR's own metadata still names the old
+head, it reports PR metadata synchronizing and leaves the head empty, so
+nothing dispatches or certifies the stale one. Wait and re-run.
+
+--check-body validates a marker or response body file before it is posted: its
+first non-blank line must be a marker, and exactly one line outside code fences
+may consist of a marker alone. With --expect, the opener must be that kind's
+marker. Exits 1 otherwise.
+
+Uses gh when it is installed, otherwise curl with GH_TOKEN (or GITHUB_TOKEN).
+The curl path resolves the repo from origin, so on a fork pass --repo: gh would
+have found the upstream and origin is your copy.
+
+Set REVIEW_LOOP_COMMENTS_FILE (a comments JSON array), REVIEW_LOOP_HEAD, and
+optionally REVIEW_LOOP_BRANCH_HEAD to run against fixtures instead of the network.
+USAGE
+}
+
+die() { echo "review-loop-state: $1" >&2; exit 1; }
+
+pr=""; repo=""; recorded=""; as_json=0; check_body=""; expect=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --expect)   [ $# -ge 2 ] || die "--expect needs a value"; expect="$2"; shift 2
+                case "$expect" in review|response) ;; *) die "--expect takes review or response" ;; esac ;;
+    --repo)     [ $# -ge 2 ] || die "--repo needs a value"; repo="$2"; shift 2 ;;
+    --recorded) [ $# -ge 2 ] || die "--recorded needs a value"; recorded="$2"; shift 2 ;;
+    --check-body) [ $# -ge 2 ] || die "--check-body needs a value"; check_body="$2"; shift 2 ;;
+    --json)     as_json=1; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    -*)         die "unknown flag: $1" ;;
+    *)          if [ -n "$pr" ]; then die "unexpected argument: $1"; fi; pr="$1"; shift ;;
+  esac
+done
+[ -n "$pr" ] || [ -n "$check_body" ] || { usage >&2; exit 2; }
+command -v jq >/dev/null || die "jq is required"
+
+review_marker='<!-- deep-review-marker -->'
+response_marker='<!-- address-deep-review-marker -->'
+
+# Three plain reads, so `gh` is a convenience rather than a requirement. A cloud
+# agent has no `gh` but does have curl and a token, and telling it "gh is required"
+# left the only supported way to get the round number unreachable exactly where the
+# skill insists on not counting by hand.
+curl_api() {
+  local path="$1" data="${2:-}" out status
+  local post=()
+  if [ -n "$data" ]; then post=(--data-binary "$data"); fi
+  # The token goes in on stdin, not argv: an argument is readable in `ps` for the
+  # life of the request, and this transport exists precisely where gh's handling of
+  # it is absent. curl reads HTTPS_PROXY and CURL_CA_BUNDLE from the environment on
+  # its own, so no flags for those.
+  out="$(printf 'header = "Authorization: Bearer %s"\n' "${GH_TOKEN:-${GITHUB_TOKEN:-}}" \
+    | curl -sS -w '\n%{http_code}' --config - \
+        -H 'Accept: application/vnd.github+json' \
+        ${post[@]+"${post[@]}"} \
+        "https://api.github.com$path")" || return 1
+  status="${out##*$'\n'}"
+  [ "$status" = 200 ] || { echo "GitHub returned $status for $path" >&2; return 1; }
+  printf '%s' "${out%$'\n'*}"
+}
+
+# The remote, not `gh repo view`. A URL parse works with no CLI and no network.
+repo_from_git() {
+  local url
+  url="$(git remote get-url origin 2>/dev/null)" || return 1
+  url="${url%.git}"
+  case "$url" in
+    *github.com[:/]*) url="${url#*github.com}"; printf '%s' "${url#[:/]}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# shellcheck disable=SC2016
+heads_query='query($owner: String!, $name: String!, $pr: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) { headRefOid headRef { target { oid } } } } }'
+heads_tsv() {
+  jq -er 'if (.errors // []) != [] then error(.errors[0].message // "graphql errors") else . end
+    | .data.repository.pullRequest // error("no pull request")
+    | [.headRefOid // "", .headRef.target.oid // ""] | @tsv'
+}
+
+branch_head=""
+if [ -n "$check_body" ]; then
+  comments="$(jq -Rs '[{body: .}]' "$check_body")" || die "cannot read $check_body"
+elif [ -n "${REVIEW_LOOP_COMMENTS_FILE:-}" ]; then
+  comments="$(cat "$REVIEW_LOOP_COMMENTS_FILE")" || die "cannot read fixture"
+  head_sha="${REVIEW_LOOP_HEAD:-}"
+  branch_head="${REVIEW_LOOP_BRANCH_HEAD:-}"
+elif command -v gh >/dev/null; then
+  api_repo="${repo:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}" || die "cannot resolve repo"
+  comments="$(gh api "repos/$api_repo/issues/$pr/comments" --paginate)" || die "cannot read comments"
+  heads="$(gh api graphql -f query="$heads_query" -f owner="${api_repo%%/*}" \
+             -f name="${api_repo#*/}" -F pr="$pr" | heads_tsv)" || die "cannot read head"
+  IFS=$'\t' read -r head_sha branch_head <<<"$heads"
+else
+  command -v curl >/dev/null || die "needs gh, or curl and a token in GH_TOKEN"
+  api_repo="${repo:-$(repo_from_git)}" || die "cannot resolve repo -- pass --repo owner/name"
+  [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ] || die "no GH_TOKEN (or GITHUB_TOKEN) to read the API with"
+  # Pagination matters: a PR at the round cap has more than one page of comments,
+  # and a short read undercounts rounds, which is the failure this script prevents.
+  comments='[]'
+  page=1
+  # Capped, because the break depends on the server ending pagination honestly and
+  # a runaway here hangs rather than fails -- which the arg-parser guard below
+  # exists to prevent, in the same file. 50 pages is 5,000 comments.
+  while [ "$page" -le 50 ]; do
+    chunk="$(curl_api "/repos/$api_repo/issues/$pr/comments?per_page=100&page=$page")" \
+      || die "cannot read comments"
+    [ "$(printf '%s' "$chunk" | jq 'length')" -gt 0 ] || break
+    comments="$(jq -s 'add' <(printf '%s' "$comments") <(printf '%s' "$chunk"))"
+    if [ "$(printf '%s' "$chunk" | jq 'length')" -lt 100 ]; then break; fi
+    page=$((page + 1))
+  done
+  if [ "$page" -gt 50 ]; then die "more than 50 pages of comments -- refusing to keep paging"; fi
+  heads_body="$(jq -nc --arg q "$heads_query" --arg owner "${api_repo%%/*}" \
+    --arg name "${api_repo#*/}" --arg pr "$pr" \
+    '{query: $q, variables: {owner: $owner, name: $name, pr: ($pr | tonumber)}}')" \
+    || die "cannot read head"
+  if heads="$(curl_api /graphql "$heads_body" | heads_tsv)"; then
+    IFS=$'\t' read -r head_sha branch_head <<<"$heads"
+  else
+    pull="$(curl_api "/repos/$api_repo/pulls/$pr" \
+      | jq -er '[.head.sha, .head.ref, .head.repo.full_name // ""] | @tsv')" || die "cannot read head"
+    IFS=$'\t' read -r head_sha head_ref head_repo <<<"$pull"
+    if [ -n "$head_repo" ]; then
+      branch_head="$(curl_api "/repos/$head_repo/git/ref/heads/$head_ref" | jq -er '.object.sha')" \
+        || die "cannot read head"
+    fi
+  fi
+fi
+
+pr_head="${head_sha:-}"
+metadata_synchronizing=no
+if [ -n "$branch_head" ] && [ -n "$pr_head" ] && [ "$branch_head" != "$pr_head" ]; then
+  metadata_synchronizing=yes
+  head_sha=""
+fi
+
+# A marker is a marker only where the comment opens. Matching it anywhere in the body
+# means a review that merely quotes the other skill's marker string counts as one --
+# and a review arguing about which string is canonical has to quote it. Run 2's review
+# on this PR did, and was one table row from planting a blocking finding that nothing
+# can ever clear. Both skills say to open with the marker, so where it sits is the
+# fact to read.
+# The first line with anything on it -- not literally line 1, because a leading blank
+# line is a plausible accident and losing a whole round to one is not a trade worth
+# making. "Anything" means a non-space character rather than a non-empty string: a
+# line holding one space hid a marker exactly the way an empty one did, and CR is
+# whitespace, so this covers a CRLF body's blank line without a separate strip.
+jq_defs='
+  def opener: (.body | split("\n") | map(select(test("[^[:space:]]"))) | first // "");
+  def reviews:   [ .[] | select(opener | contains($review)) ];
+  def responses: [ .[] | select((opener | contains($resp)) and (opener | contains($review) | not)) ];
+  def trimmed: gsub("^[[:space:]]+|[[:space:]]+$"; "");
+  def top_markers:
+    reduce (.body | split("\n")[] | trimmed) as $line ({fence: null, n: 0};
+      .fence as $fence
+      | if $fence == null then
+          if ($line | test("^(```+|~~~+)")) then .fence = ($line | capture("^(?<f>`+|~+)").f)
+          elif $line == $review or $line == $resp then .n += 1
+          else . end
+        elif ($line | test("^" + $fence + "+$")) then .fence = null
+        else . end)
+    | .n;
+  def top_markers_or_null: if . == null then null else top_markers end;
+  def header: .body | split("</sub>")[0];
+  def responded_run: [ header | match("responded to run ([0-9]+)"; "g") | .captures[0].string | tonumber ] | first;
+  def rows:
+    [ .body | split("\n")[] | select(startswith("|"))
+      | [ split("|")[] | gsub("^ +| +$"; "") ] | select(length > 5) ];
+  def cell: gsub("[*_`]"; "") | ascii_downcase | gsub("^ +| +$"; "");
+  def outcome: cell;
+  def finding_rows: [ rows[] | select(.[2] | cell | test("^(must|should|consider)")) ];
+  def reported_findings:
+    [ header | match("([0-9]+) (?:unique )?findings?(?![[:alnum:]])"; "g") | .captures[0].string | tonumber ] | first;
+  def marker_run: ([ header | match("re-ran \\(run ([0-9]+)\\)"; "g") | .captures[0].string | tonumber ] | first) // 1;
+  def marker_must: [ header | match("\\(([0-9]+) must-address\\)"; "g") | .captures[0].string | tonumber ] | first;
+  def closed_outcome: outcome | test("^(taken|settled)([^[:alnum:]]|$)") and (test("^taken in part") | not);
+  def pushed:
+    [ .body | match("Pushed:?[*_ ]*(?:<code>|`)?([0-9a-f]{7,40}|none|rejected)(?![[:alnum:]])"; "g")
+      | .captures[0].string ] | first;
+'
+jqf() {
+  printf '%s' "$comments" \
+    | jq -r --arg review "$review_marker" --arg resp "$response_marker" "$jq_defs$1"
+}
+
+if [ -n "$check_body" ]; then
+  # shellcheck disable=SC2016
+  opens="$(jqf '.[0] | opener | trimmed | . == $review or . == $resp')"
+  top_lines="$(jqf '.[0] | top_markers')"
+  [ "$opens" = true ] || die "$check_body does not open with a marker line"
+  if [ -n "$expect" ]; then
+    want="$review_marker"; if [ "$expect" = response ]; then want="$response_marker"; fi
+    [ "$(jqf '.[0] | opener | trimmed')" = "$want" ] || die "$check_body does not open with the $expect marker"
+  fi
+  [ "$top_lines" -eq 1 ] || die "$check_body has $top_lines top-level marker lines -- expected exactly 1"
+  echo "body ok           $check_body opens with a marker and holds 1 top-level marker line"
+  exit 0
+fi
+
+marker_rounds="$(jqf 'reviews | length')"
+named_rounds="$(jqf '[ responses[] | responded_run // empty ] | max // 0')"
+
+# The run number a marker names, not how many markers there are. Counting them
+# meant a round reviewed twice read as two rounds, and it stayed inflated for every
+# round after -- then wrote itself into the record, because the loop dispatched the
+# later rounds under the wrong number and their own headers agreed with it.
+#
+# Only the comment's own header, the text before its first </sub>: a review that
+# discusses another round quotes that round's header in its prose. Reading the whole
+# body took the quotation -- the max offered four run numbers on this script's own
+# PR, and even the first match was a quote on a first-run marker, whose header names
+# no run. A marker naming no run is run 1 -- that is
+# deep-review's first-run header format, and it makes two first-run markers on one
+# head read as the single round they are.
+marker_named="$(jqf '[ reviews[] | marker_run ] | max // 0')"
+
+# Still the larger of two figures, because each misses a different round: markers
+# miss one whose marker was denied, responses miss one whose response never posted.
+rounds_complete="$marker_named"
+if [ "$named_rounds" -gt "$rounds_complete" ]; then rounds_complete="$named_rounds"; fi
+next_round=$((rounds_complete + 1))
+
+certification_run="$(jqf '
+  [ reviews[] | header
+    | [ match("re-ran \\(run ([0-9]+)\\)( certification)?"; "g") ] | first
+    | select(. != null and .captures[1].string != null)
+    | .captures[0].string | tonumber ]
+  | max')"
+latest_run_responses="$(jqf "[ responses[] | select(responded_run == $rounds_complete) ] | length")"
+latest_marker_lines="$(jqf 'reviews | last | top_markers_or_null')"
+latest_response_lines="$(jqf 'responses | last | top_markers_or_null')"
+latest_run_must="$(jqf "[ reviews[] | select(marker_run == $rounds_complete) | marker_must // empty ] | max")"
+latest_response="$(jqf "[ responses[] | select(responded_run == $rounds_complete) ] | last
+  | if . == null then {pushed: null, open_must: [], findings: null, must_rows: 0,
+                       reported_findings: null, certification: false}
+    else {pushed: pushed,
+          open_must: [ finding_rows[] | select(.[2] | cell | startswith(\"must\"))
+                       | select(.[4] | closed_outcome | not) | .[1] ],
+          findings: (finding_rows | length),
+          must_rows: ([ finding_rows[] | select(.[2] | cell | startswith(\"must\")) ] | length),
+          reported_findings: reported_findings,
+          certification: (header | test(\"certification\"))} end
+  | tojson")"
+latest_pushed="$(printf '%s' "$latest_response" | jq -r '.pushed // "unknown"')"
+latest_open_must="$(printf '%s' "$latest_response" | jq -r '.open_must | length')"
+latest_findings="$(printf '%s' "$latest_response" | jq -r '.findings // 0')"
+latest_must_rows="$(printf '%s' "$latest_response" | jq -r '.must_rows')"
+latest_reported="$(printf '%s' "$latest_response" | jq -r '.reported_findings // 0')"
+latest_certification="$(printf '%s' "$latest_response" | jq -r '.certification')"
+
+# shellcheck disable=SC2016
+declines="$(jqf '
+  def refused: outcome | test("^(declined?|remedy declined|half([ -]taken)?|taken in part)([^[:alnum:]]|$)");
+  def round:
+    (header | [ match("responded to run ([0-9]+)"; "g")
+               | .captures[0].string ] | first)
+    | if . == null then null else tonumber end;
+  def finding_id:
+    ascii_downcase
+    | gsub("[[:space:]]*·[[:space:]]*"; " · ")
+    | gsub("^ +| +$"; "");
+  def finding_aliases($finding):
+    ($finding | finding_id) as $full | [$full] + ($full | split(" · "));
+  def mentions($finding):
+    [ .body | ascii_downcase
+      | match("finding #?[[:alnum:]]+([[:space:]]*·[[:space:]]*[[:alnum:]]+)*"; "g").string
+      | sub("^finding #?"; "") | finding_id ] as $mentioned
+    | any(finding_aliases($finding)[]; . as $alias
+          | any($mentioned[]; . == $alias));
+  responses as $responses
+  | [ $responses | to_entries[] as $entry
+      | ($entry.value | round) as $round
+      | ($entry.value | rows[]) as $row
+      | select($row[2] | cell | startswith("must"))
+      | select($row[4] | refused)
+      | ($row[1]) as $finding
+      | {
+          finding: $finding,
+          round: $round,
+          outcome: ($row[4] | outcome),
+          mentioned_later:
+            any($responses[($entry.key + 1):][]; mentions($finding))
+        } ]')"
+
+at_cap=no; if [ "$next_round" -gt "$ROUND_CAP" ]; then at_cap=yes; fi
+
+# An abbreviation is what a caller actually has -- every SHA in a comment header is
+# short -- so a real one is answered rather than refused. Under 7 characters is not
+# an abbreviation git would resolve either, and `yes` there is an affirmative wrong
+# answer that sends the loop round again; `unknown` says what is true.
+#
+# One-directional on purpose: a full recorded SHA against a short head reports moved.
+# Both live transports return forty characters, so that shape only arrives through
+# REVIEW_LOOP_HEAD, and guessing in the fixture's favour would hide a real mismatch.
+head_moved=unknown
+if [ -n "$recorded" ] && [ -n "$head_sha" ]; then
+  if [ "$recorded" = "$head_sha" ]; then
+    head_moved=no
+  elif [ "${#recorded}" -ge 7 ] && [ "${head_sha#"$recorded"}" != "$head_sha" ]; then
+    head_moved=no
+  elif [ "${#recorded}" -ge 7 ]; then
+    head_moved=yes
+  fi
+fi
+
+stopped_clean=no
+if [ "$at_cap" = yes ] && [ "$head_moved" = no ] && [ "$latest_run_responses" -gt 0 ] \
+    && [ "$latest_pushed" = none ] && [ "$latest_open_must" -eq 0 ]; then
+  stopped_clean=yes
+fi
+if { [ "$certification_run" = "$rounds_complete" ] || [ "$latest_certification" = true ]; } \
+    && [ "$latest_findings" -ne 0 ]; then
+  stopped_clean=no
+fi
+if [ "$latest_reported" -gt "$latest_findings" ]; then stopped_clean=no; fi
+if [ "$latest_run_must" != null ] && [ "$latest_run_must" -gt "$latest_must_rows" ]; then
+  stopped_clean=no
+fi
+
+if [ "$as_json" -eq 1 ]; then
+  jq -n --argjson rc "$rounds_complete" --argjson nr "$next_round" \
+        --argjson mr "$marker_rounds" --argjson mn "$marker_named" \
+        --argjson nn "$named_rounds" \
+        --argjson cap "$ROUND_CAP" --arg atcap "$at_cap" \
+        --argjson declines "$declines" --arg head "$head_sha" \
+        --arg pr_head "$pr_head" --arg branch_head "$branch_head" \
+        --arg syncing "$metadata_synchronizing" \
+        --arg recorded "$recorded" --arg moved "$head_moved" \
+        --arg clean "$stopped_clean" --argjson cert "$certification_run" \
+        --argjson lrr "$latest_run_responses" \
+        --argjson lml "$latest_marker_lines" --argjson lrl "$latest_response_lines" \
+        --argjson latest "$latest_response" --argjson lrm "$latest_run_must" \
+    '{rounds_complete:$rc, next_round:$nr, marker_rounds:$mr, marker_named:$mn,
+      named_rounds:$nn,
+      round_cap:$cap, at_cap:($atcap=="yes"), stopped_clean:($clean=="yes"),
+      certification_run:$cert,
+      head:$head, recorded:$recorded,
+      head_moved:$moved,
+      pr_head:$pr_head, branch_head:$branch_head,
+      metadata_synchronizing:($syncing=="yes"),
+      latest_run_responses:$lrr, latest_run_responded:($lrr > 0),
+      latest_response_pushed:$latest.pushed,
+      latest_response_open_must_address:$latest.open_must,
+      latest_response_findings:$latest.findings,
+      latest_response_reported_findings:$latest.reported_findings,
+      latest_response_certification:$latest.certification,
+      latest_run_must_address:$lrm,
+      latest_marker_top_level_markers:$lml,
+      latest_response_top_level_markers:$lrl,
+      must_address_declines:$declines,
+      blocking_must_address:($declines | map(.finding) | unique)}'
+  exit 0
+fi
+
+echo "rounds complete   $rounds_complete  (highest run named: markers $marker_named, responses $named_rounds; $marker_rounds marker comments)"
+printf 'next round        %s of %s' "$next_round" "$ROUND_CAP"
+if [ "$stopped_clean" = yes ]; then
+  printf '   AT CAP -- stopped clean'
+elif [ "$at_cap" = yes ] && [ "$metadata_synchronizing" = yes ]; then
+  printf '   AT CAP -- wait (PR metadata synchronizing)'
+elif [ "$at_cap" = yes ]; then
+  printf '   AT CAP -- escalate'
+fi
+echo
+if [ "$certification_run" != null ]; then echo "certification     run $certification_run"; fi
+if [ "$latest_run_responses" -gt 0 ]; then
+  echo "responded         run $rounds_complete: yes ($latest_run_responses)"
+  printf '%s' "$latest_response" | jq -r '"latest response   pushed \(.pushed // "unknown"), open must-address \(
+    if (.open_must | length) == 0 then "none" else (.open_must | join(", ")) end), \(.findings) findings (header \(.reported_findings // "none"))"
+    + if .certification then ", certification" else "" end'
+else
+  echo "responded         run $rounds_complete: no"
+fi
+echo "top-level markers latest review ${latest_marker_lines/null/none}, latest response ${latest_response_lines/null/none}"
+if [ "$metadata_synchronizing" = yes ]; then
+  echo "head              PR metadata synchronizing -- branch at $branch_head, PR still names $pr_head; wait and re-run"
+else
+  echo "head              ${head_sha:-unknown}"
+fi
+if [ -n "$recorded" ]; then echo "recorded          $recorded  (moved: $head_moved)"; fi
+declines_text="$(printf '%s' "$declines" | jq -r '
+  map("run \(.round // "?") #\(.finding)"
+      + if .mentioned_later then " (mentioned later)" else "" end)
+  | join("; ")')"
+if [ -n "$declines_text" ]; then
+  echo "declines to check $declines_text"
+else
+  echo "declines to check none recorded"
+fi
