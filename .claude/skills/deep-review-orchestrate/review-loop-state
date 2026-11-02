@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# != 2 || ! $1 =~ ^[0-9]+$ || ! $2 =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+  echo 'Usage: review-loop-state <PR> <owner/repo>' >&2
+  exit 1
+fi
+
+gh api --paginate --slurp "repos/$2/issues/$1/comments?per_page=100" | jq '
+  def trim: gsub("^\\s+|\\s+$"; "");
+  def header:
+    gsub("<!--[\\s\\S]*?-->"; "") | trim
+    | if startswith("<sub>") then split("</sub>")[0]
+      else split("\n")[0] end;
+  def run($kind):
+    header as $h
+    | (if $kind == "response" then
+         "responded to run (?<n>[0-9]+)"
+       else
+         "re-ran \\(run (?<n>[0-9]+)(?:,[^)]*)?\\)|^[ #*]*deep-review, run (?<title>[0-9]+)"
+       end) as $pattern
+    | ([$h | capture($pattern) | (.n // .title) | tonumber][0])
+      // (if $kind == "review" and ($h | test("deep-review(?:</b>)? ran on"))
+          then 1 else error("Unrecognized review header: " + $h) end);
+  [ .[][]
+    | .body as $body
+    | ($body | trim | split("\n")[0] | trim) as $first
+    | (if $first == "<!-- deep-review-marker -->" then "review"
+       elif $first == "<!-- address-deep-review-marker -->" then "response"
+       else null end) as $kind
+    | select($kind != null)
+    | {kind: $kind, run: ($body | run($kind)), url: .html_url}
+  ] as $comments
+  | ([$comments[].run] | max // 0) as $last
+  | {next_round: ($last + 1), comments: $comments}
+'
