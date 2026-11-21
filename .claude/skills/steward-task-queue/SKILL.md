@@ -319,7 +319,9 @@ Every tick:
    then select unblocked candidates in the queue's existing priority order and promote candidates
    that pass the value test until Effective Ready reaches `target_maximum` or no eligible
    candidate remains. Report a shortfall only after repairs and valuable candidates are exhausted.
-11. Report each mutation, then re-arm the cadence.
+11. Where a queue watcher dispatches the role sessions, check its health under **Watching the
+   queue watcher**.
+12. Report each mutation, then re-arm the cadence.
 
 ### 6. Apply the value test before Ready
 
@@ -593,6 +595,49 @@ Remote Control thread). Give each thread's title and link, the action, and the e
 Send nothing when the list is empty, and don't list again a thread the coordinator kept open unless
 its state has changed since. The coordinator rechecks each entry before acting and brings stale
 waits back to Jackson. The steward sends the list only to the coordinator, never to Jackson.
+
+## Watching the queue watcher
+
+Where a `queue-dispatch` watcher starts the worker and reviewer sessions (local-config's
+`bin/queue-dispatch`, run by launchd every five minutes), the steward checks its health once a
+tick. Keep it cheap: read only the tail of `~/Library/Logs/queue-dispatch.log` (about the last
+200 lines, some eight hours) and `queue-dispatch status`. Never open session transcripts for this.
+A steward that can't read the log or run `status` says so in its tick report rather than skipping
+the check silently.
+
+Line timestamps are UTC. The reset times inside usage-limit lines and in `status` are local time.
+
+Look for:
+
+- **The watcher is down**: the newest timestamped line is more than ten minutes old, or the tail
+  ends in a traceback rather than a timestamped line.
+- **A slot held by a session that isn't working**: a `stop <id> failed` line, or a session that
+  `queue-dispatch status` still lists (`STUCK` included) whose issue shows no tracker or PR
+  activity for the two hours section 7 uses.
+- **A session that ended without effect**: a `#n session <id> ended` or `#n session <id> done;
+  stopping` line where #n shows no Claim, comment or handoff since that session's `started session
+  <id> for #n` line and still sits in the Queue it was launched from. A session that finds its item
+  no longer eligible ends this way by design, so report it only when the issue is still eligible
+  for that role or the same issue has ended this way before.
+- **A usage-limit pause**: `queue-dispatch status` printing `paused at the usage limit until …`.
+  A `~/.queue-dispatch/limit_until` file whose time has passed is history, not a pause. Name the
+  reset time. Claims the limited session left follow section 7 unchanged; the watcher's
+  "claim is orphaned" comment on the issue is evidence the session is gone, not a reason to wait.
+- **A relaunch loop**: the same issue started three or more times in the tail without its Queue
+  moving.
+- **A launch on an ineligible item**: a `started session <id> for #n` line where #n was not in the
+  role's selectable Queue when that line was written (`Ready` for a worker, `Needs review` for a
+  reviewer), read from the issue's history. Its state now proves nothing, since a claim moves it.
+- **Failing checks**: a role whose newest line is `FAILED`, or whose `~/.queue-dispatch/<role>/failures`
+  holds 3 or more. A `FAILED` line followed by a non-`FAILED` line for that role has recovered,
+  and the watcher writes `checks are working again` only after a run of three. Other `ALERT`
+  lines (a question for you, waiting for input, `STUCK`, a usage limit) are not failures; they
+  belong to the bullets above.
+
+Report to the coordinator (or to the user where there is no coordinator) only when one of these
+is current, naming the issue, the session ID and the log lines. Say nothing on a healthy tick.
+The watcher's own notifications go to the person; this check exists so a fault is caught even
+when nobody is looking at them.
 
 ## Backend operations
 
